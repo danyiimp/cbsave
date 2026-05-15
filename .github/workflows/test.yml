@@ -1,0 +1,98 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify environment
+        run: |
+          uname -a
+          osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSPasteboard.generalPasteboard.clearContents; "ok"' \
+            && echo "✓ JXA + NSPasteboard available"
+
+      - name: cbsave --version
+        run: ./plugins/cbsave/skills/cbsave/scripts/cbsave --version
+
+      - name: cbsave --help
+        run: ./plugins/cbsave/skills/cbsave/scripts/cbsave --help | head -5
+
+      - name: text mode — stdin
+        run: echo "hello cbsave" | ./plugins/cbsave/skills/cbsave/scripts/cbsave
+
+      - name: text mode — -t flag
+        run: ./plugins/cbsave/skills/cbsave/scripts/cbsave -t "tracking-id 1234"
+
+      - name: file mode — single non-image
+        run: |
+          echo "csv,data" > /tmp/regression.csv
+          ./plugins/cbsave/skills/cbsave/scripts/cbsave /tmp/regression.csv
+
+      - name: file mode — image (PNG raw bytes)
+        run: |
+          base64 -d > /tmp/pixel.png <<'B64'
+          iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=
+          B64
+          ./plugins/cbsave/skills/cbsave/scripts/cbsave /tmp/pixel.png
+
+      - name: file mode — multiple files
+        run: |
+          echo a > /tmp/a.txt; echo b > /tmp/b.txt; echo c > /tmp/c.txt
+          ./plugins/cbsave/skills/cbsave/scripts/cbsave /tmp/a.txt /tmp/b.txt /tmp/c.txt
+
+      - name: stdin with --name (writes tempfile)
+        run: |
+          echo "stdin content" | ./plugins/cbsave/skills/cbsave/scripts/cbsave - --name from-stdin.txt
+          test -f /tmp/from-stdin.txt
+          grep -q "stdin content" /tmp/from-stdin.txt
+
+      - name: rejects path traversal in --name
+        run: |
+          set +e
+          echo x | ./plugins/cbsave/skills/cbsave/scripts/cbsave - --name "../etc/passwd"
+          rc=$?
+          set -e
+          [ "$rc" = "2" ] || { echo "want rc=2, got $rc"; exit 1; }
+
+      - name: rejects leading slash in --name
+        run: |
+          set +e
+          echo x | ./plugins/cbsave/skills/cbsave/scripts/cbsave - --name "/etc/passwd"
+          rc=$?
+          set -e
+          [ "$rc" = "2" ] || { echo "want rc=2, got $rc"; exit 1; }
+
+      - name: rejects empty stdin
+        run: |
+          set +e
+          ./plugins/cbsave/skills/cbsave/scripts/cbsave < /dev/null
+          rc=$?
+          set -e
+          [ "$rc" = "2" ] || { echo "want rc=2, got $rc"; exit 1; }
+
+      - name: rejects missing file
+        run: |
+          set +e
+          ./plugins/cbsave/skills/cbsave/scripts/cbsave /tmp/does-not-exist-$RANDOM
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "want rc=1, got $rc"; exit 1; }
+
+      - name: filename starting with dash via --
+        run: |
+          echo x > /tmp/-weird.txt
+          ./plugins/cbsave/skills/cbsave/scripts/cbsave -- /tmp/-weird.txt
+          rm /tmp/-weird.txt
+
+      - name: shellcheck
+        run: |
+          brew install shellcheck >/dev/null 2>&1 || true
+          shellcheck ./plugins/cbsave/skills/cbsave/scripts/cbsave ./install.sh

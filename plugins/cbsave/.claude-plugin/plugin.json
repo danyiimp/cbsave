@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "cbsave",
+  "version": "1.1.0",
+  "description": "Universal macOS clipboard skill — put files, text, or inline images on the pasteboard from natural language. One bash script, zero dependencies.",
+  "author": {
+    "name": "Daniil Malai",
+    "email": "danymworking@gmail.com"
+  },
+  "homepage": "https://github.com/danyiimp/cbsave",
+  "repository": "https://github.com/danyiimp/cbsave",
+  "license": "MIT",
+  "keywords": ["clipboard", "pasteboard", "macos", "pbcopy", "files", "images", "productivity"]
+}

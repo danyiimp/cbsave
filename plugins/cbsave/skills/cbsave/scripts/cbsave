@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# cb / cbsave — put text or files onto the macOS clipboard.
+#
+# One command, two modes (the right one is picked from your arguments):
+#
+#   cb file.pdf                  # file mode  — Cmd+V attaches the file
+#   cb a.png b.png               # multi-file — image bytes auto-attached
+#   cmd | cb                     # text mode  — Cmd+V pastes plain text
+#   cmd | cb --name out.csv      # file mode  — stdin → /tmp/out.csv → file
+#   cb -t "quick text"           # text mode  — Cmd+V pastes the arg
+#
+# For image files (png/jpg/gif/heic/heif/tif/bmp/webp/svg/pdf) the raw
+# bytes are also placed on the pasteboard under the matching UTI, so
+# Cmd+V in Claude Code, Slack, Notion, VS Code, iMessage, Notes, Mail,
+# Telegram, etc. inline-pastes the image — not just a path string.
+#
+# Zero dependencies: uses built-in osascript / JavaScript-for-Automation.
+# Works on every macOS 10.10+. No Swift, no Xcode CLT, no Homebrew.
+#
+# Exit codes:
+#   0  success
+#   1  filesystem error (missing file, unreadable stdin, non-macOS host)
+#   2  bad arguments
+#   3  pasteboard write failed (rare; sandbox/TCC issue)
+#
+# License: MIT
+set -euo pipefail
+
+VERSION="1.1.0"
+PROG="${0##*/}"
+
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+  cat <<USAGE
+$PROG $VERSION — put text or files on the macOS clipboard
+
+USAGE:
+  $PROG <file> [<file> ...]            # files → clipboard (image-aware)
+  cmd | $PROG                          # stdin → clipboard as text
+  cmd | $PROG --name <name>            # stdin → clipboard as a file
+  $PROG -t "text" | $PROG --text "..." # arg  → clipboard as text
+  $PROG -h | --help | --version
+
+After running, Cmd+V pastes the result everywhere — Finder, Telegram,
+Slack, Mail, iMessage, Claude Code, Notes, Notion, VS Code, etc.
+
+For image files the raw bytes are also placed under their native UTI
+(public.png/jpeg/heic/…) so chat composers inline-paste the image
+instead of only seeing a file reference.
+
+EXAMPLES:
+  $PROG report.pdf                     # one file as attachment
+  $PROG screenshot.png                 # image — inline-paste in chats
+  $PROG a.png b.png c.png              # multi-file paste
+  date | $PROG                         # current date → clipboard text
+  jq . data.json | $PROG --name pretty.json   # stdin → tempfile → clipboard
+  $PROG -t "tracking-id 1234"          # quick text in one line
+
+REQUIREMENTS:
+  macOS 10.10 (Yosemite) or later. No external dependencies.
+USAGE
+}
+
+# ---------- arg parsing ----------
+declare -a inputs=()
+STDIN_NAME=""
+TEXT_ARG=""
+TEXT_MODE_FROM_ARG=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    --version)    echo "$VERSION"; exit 0 ;;
+    -t|--text)
+      shift
+      [ $# -gt 0 ] || { err "--text needs a value"; exit 2; }
+      TEXT_ARG="$1"
+      TEXT_MODE_FROM_ARG=1
+      ;;
+    --name)
+      shift
+      [ $# -gt 0 ] || { err "--name needs a value"; exit 2; }
+      STDIN_NAME="$1"
+      ;;
+    --)           shift; while [ $# -gt 0 ]; do inputs+=("$1"); shift; done; break ;;
+    -)            inputs+=("-") ;;
+    -*)           err "unknown option: $1"; exit 2 ;;
+    *)            inputs+=("$1") ;;
+  esac
+  shift
+done
+
+# ---------- macOS check ----------
+if [ "$(uname -s)" != "Darwin" ]; then
+  err "macOS only (uname says: $(uname -s))"
+  exit 1
+fi
+
+# ---------- mode resolution ----------
+# Priority: -t/--text > positional files > stdin
+#   - -t/--text given             → text mode (the arg)
+#   - any positional input given  → file mode
+#   - else if stdin not a tty     → text mode (read stdin)
+#   - else                        → error (nothing to do)
+#
+# In file mode, a positional `-` reads stdin and writes to a tempfile
+# named after --name (or cbsave-stdin.txt). Specifying --name forces
+# file mode even if you'd otherwise get text — the name signals intent.
+
+if [ $TEXT_MODE_FROM_ARG -eq 1 ]; then
+  MODE="text"
+  TEXT="$TEXT_ARG"
+elif [ "${#inputs[@]}" -gt 0 ]; then
+  MODE="file"
+elif [ -n "$STDIN_NAME" ]; then
+  # only --name given → treat as `cb - --name X`
+  MODE="file"
+  inputs+=("-")
+elif [ ! -t 0 ]; then
+  # stdin is piped, no other input → text mode
+  MODE="text"
+  TEXT="$(cat)"
+  if [ -z "$TEXT" ]; then
+    err "stdin was empty — nothing to put on the clipboard"
+    exit 2
+  fi
+else
+  usage >&2; exit 2
+fi
+
+# ---------- text mode ----------
+if [ "$MODE" = text ]; then
+  # Put the text on the pasteboard via NSPasteboard so unicode and any
+  # bytes survive (pbcopy does this too, but going through JXA keeps
+  # the implementation consistent with the file-mode path and avoids
+  # locale-dependent pbcopy quirks).
+  export CBSAVE_TEXT="$TEXT"
+  if ! osascript -l JavaScript <<'JXA'
+ObjC.import('AppKit');
+const env = $.NSProcessInfo.processInfo.environment;
+const text = ObjC.unwrap(env.objectForKey('CBSAVE_TEXT')) || '';
+const pb = $.NSPasteboard.generalPasteboard;
+pb.clearContents;
+const types = $.NSMutableArray.alloc.init;
+types.addObject('public.utf8-plain-text');
+pb.declareTypesOwner(types, $());
+pb.setStringForType(text, 'public.utf8-plain-text');
+undefined;
+JXA
+  then
+    err "pasteboard write failed (exit $?)"
+    exit 3
+  fi
+  # short summary
+  byte_len=$(printf '%s' "$TEXT" | wc -c | tr -d ' ')
+  line_count=$(printf '%s' "$TEXT" | awk 'END{print NR}')
+  printf 'text ready in clipboard (%s bytes, %s lines).\n' "$byte_len" "${line_count:-0}"
+  exit 0
+fi
+
+# ---------- file mode ----------
+abspath() {
+  # POSIX-portable abspath (no readlink -f dependency)
+  local p="$1"
+  if [ -d "$p" ]; then
+    (cd "$p" && pwd)
+  else
+    local d
+    d=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || { err "no such dir: $(dirname "$p")"; exit 1; }
+    printf '%s/%s\n' "$d" "$(basename "$p")"
+  fi
+}
+
+declare -a paths=()
+for f in "${inputs[@]}"; do
+  if [ "$f" = "-" ]; then
+    name="${STDIN_NAME:-cbsave-stdin.txt}"
+    case "$name" in /*|*..*) err "invalid --name: $name"; exit 2 ;; esac
+    tmp="/tmp/$name"
+    if ! cat > "$tmp"; then
+      err "failed to write stdin to $tmp"
+      exit 1
+    fi
+    paths+=("$tmp")
+  else
+    [ -e "$f" ] || { err "not found: $f"; exit 1; }
+    paths+=("$(abspath "$f")")
+  fi
+done
+
+# Detect image UTIs (for inline-paste into Electron/Cocoa composers).
+ext_to_uti() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    png)         echo public.png ;;
+    jpg|jpeg)    echo public.jpeg ;;
+    gif)         echo com.compuserve.gif ;;
+    heic)        echo public.heic ;;
+    heif)        echo public.heif ;;
+    tif|tiff)    echo public.tiff ;;
+    bmp)         echo com.microsoft.bmp ;;
+    webp)        echo org.webmproject.webp ;;
+    svg)         echo public.svg-image ;;
+    pdf)         echo com.adobe.pdf ;;
+    *)           echo "" ;;
+  esac
+}
+declare -a utis=()
+for p in "${paths[@]}"; do
+  ext="${p##*.}"
+  if [ "$ext" = "$p" ]; then utis+=(""); else utis+=("$(ext_to_uti "$ext")"); fi
+done
+
+export CBSAVE_PATHS CBSAVE_UTIS
+CBSAVE_PATHS=$(printf '%s\n' "${paths[@]}")
+CBSAVE_UTIS=$(printf '%s\n' "${utis[@]}")
+
+if ! osascript -l JavaScript <<'JXA'
+ObjC.import('AppKit');
+const env = $.NSProcessInfo.processInfo.environment;
+const raw  = ObjC.unwrap(env.objectForKey('CBSAVE_PATHS')) || '';
+const rawU = ObjC.unwrap(env.objectForKey('CBSAVE_UTIS'))  || '';
+const paths = raw.split('\n').filter(p => p.length > 0);
+const utis  = rawU.split('\n');  // parallel to paths; '' for non-image
+if (paths.length === 0) {
+  console.log('cbsave: no paths');
+  $.exit(3);
+}
+
+// ---- Phase 1: file references for ALL paths.
+// Finder's own pattern (and public-domain `pbfile`): declare
+// NSFilenamesPboardType + setPropertyList. Cocoa auto-expands the path
+// list into per-item public.file-url entries. Two simpler paths broke:
+//   1. pb.writeObjects(NSArray<NSURL>) — JXA collapses array to 1 item.
+//   2. NSPasteboardItem + writeObjects + setString:forType: — data was
+//      not visible on items after writeObjects.
+// setPropertyList:forType: bridges cleanly and Cocoa builds the items.
+
+const pb = $.NSPasteboard.generalPasteboard;
+pb.clearContents;
+
+const declared = $.NSMutableArray.alloc.init;
+declared.addObject('NSFilenamesPboardType');
+declared.addObject('public.utf8-plain-text');
+const seenUti = {};
+for (const u of utis) {
+  if (u && !seenUti[u]) { declared.addObject(u); seenUti[u] = 1; }
+}
+pb.declareTypesOwner(declared, $());
+
+const nsPaths = $.NSMutableArray.alloc.init;
+for (const p of paths) nsPaths.addObject(p);
+if (!pb.setPropertyListForType(nsPaths, 'NSFilenamesPboardType')) {
+  console.log('cbsave: setPropertyList returned false');
+  $.exit(3);
+}
+
+// ---- Phase 2: filename as plain text (matches Finder so pasting into
+// TextEdit gives the name, not the raw file:// URL).
+function basename(p) { const i = p.lastIndexOf('/'); return i < 0 ? p : p.slice(i + 1); }
+pb.setStringForType(basename(paths[0]), 'public.utf8-plain-text');
+
+// ---- Phase 3: raw image bytes for image files.
+// Modern macOS (13+) and Electron-based composers (Claude Code, Slack,
+// Notion, VS Code) read clipboardData.items[i].type === 'image/png'
+// from the matching NSPasteboard UTI. Per xpbc's findings the TIFF
+// lingua franca is no longer needed — apps read native UTIs directly.
+// We still get TIFF for free: Cocoa's UTI bridge auto-derives public.tiff.
+const items = pb.pasteboardItems;
+for (let i = 0; i < paths.length && i < items.count; i++) {
+  const uti = utis[i];
+  if (!uti) continue;
+  const data = $.NSData.dataWithContentsOfFile(paths[i]);
+  if (!data || data.length === 0) continue;
+  const item = items.objectAtIndex(i);
+  item.setDataForType(data, uti);
+  item.setStringForType(basename(paths[i]), 'public.utf8-plain-text');
+}
+undefined;
+JXA
+then
+  rc=$?
+  err "pasteboard write failed (exit $rc)"
+  exit 3
+fi
+
+# ---------- friendly summary ----------
+if [ "${#paths[@]}" -eq 1 ]; then
+  printf '%s ready in clipboard. Cmd+V pastes as attachment.\n' "$(basename "${paths[0]}")"
+else
+  printf '%d files ready in clipboard. Cmd+V pastes them as attachments.\n' "${#paths[@]}"
+fi

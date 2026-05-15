@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "cbsave",
+  "version": "1.1.0",
+  "description": "macOS clipboard skill that makes 'put this on my clipboard' work for files and images, not just text",
+  "owner": {
+    "name": "Daniil Malai",
+    "email": "danymworking@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "cbsave",
+      "description": "Universal macOS clipboard skill — files, text, and inline images. Tiny: one bash script, zero dependencies. Auto-triggers on natural-language clipboard intent.",
+      "source": "./plugins/cbsave",
+      "version": "1.1.0",
+      "author": {
+        "name": "Daniil Malai"
+      },
+      "homepage": "https://github.com/danyiimp/cbsave",
+      "repository": "https://github.com/danyiimp/cbsave",
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": ["clipboard", "pasteboard", "macos", "pbcopy", "files", "images"]
+    }
+  ]
+}
